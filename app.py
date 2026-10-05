@@ -1,24 +1,5 @@
 #!/usr/bin/env python3
-"""
-NEEDLE SUBTITLE  //  Gradio app  //  Silero VAD + Needle  ->  3 kinds of SRT
-
-    pip install gradio needle silero-vad
-    (ffmpeg must be on PATH)
-
-    python app.py
-
-LEFT  : paste a file path OR drag & drop a video/audio file, pick language
-RIGHT : live log + 3 subtitle files
-          1. YouTube / horizontal   (sentence level, Netflix-style cues)
-          2. Shorts / Reels vertical (1-3 words per cue, punchy)
-          3. Word level             (one cue per word)
-
-If you paste a path, outputs are saved NEXT TO that file.
-If you drag & drop, outputs go to ./needle_output/<name>/
-"""
-
 from __future__ import annotations
-
 import inspect
 import os
 import queue
@@ -31,6 +12,27 @@ import threading
 import time
 import traceback
 import wave
+
+# ============================================================
+# ENVIRONMENT  (Hugging Face Space vs local machine)
+# ============================================================
+
+try:
+    import spaces
+except ImportError:
+    spaces = None
+
+# Hugging Face sets SPACE_ID automatically on every Space
+ON_SPACES = bool(os.environ.get("SPACE_ID"))
+IS_LOCAL = not ON_SPACES
+
+
+def gpu(fn):
+    """@spaces.GPU only on Hugging Face; a no-op locally."""
+    if spaces is not None and ON_SPACES:
+        return spaces.GPU(fn)
+    return fn
+
 
 # ============================================================
 # CONFIG
@@ -464,6 +466,32 @@ def read_preview(path: str, n_cues: int) -> str:
     return head + f"\n\n... preview = first {PREVIEW_CUES} of {n_cues:,} cues. Download the file for all."
 
 
+from silero_vad import load_silero_vad, get_speech_timestamps
+import numpy as np
+import torch
+
+
+@gpu
+def vad_detection(wav_file):
+    with wave.open(wav_file, "rb") as wf:
+        audio = wf.readframes(wf.getnframes())
+
+    audio = np.frombuffer(audio, dtype=np.int16).astype(np.float32)
+    audio /= 32768.0
+
+    wav_tensor = torch.from_numpy(audio)
+
+    speech = get_speech_timestamps(
+        wav_tensor,
+        load_silero_vad(),
+        sampling_rate=16000,
+        return_seconds=True,
+    )
+
+    del wav_tensor
+    return speech
+
+
 def run_pipeline(src, language, out_dir, max_words, upper, strip, emit, stop: threading.Event):
     """
     emit(kind, payload):  ("log", str) | ("bar", str)
@@ -509,10 +537,7 @@ def run_pipeline(src, language, out_dir, max_words, upper, strip, emit, stop: th
 
     # ---- 2. VAD ----
     emit("bar", "loading Silero VAD ...")
-    from silero_vad import load_silero_vad, read_audio, get_speech_timestamps
-    wav_tensor = read_audio(wav_file)
-    speech = get_speech_timestamps(wav_tensor, load_silero_vad(), return_seconds=True)
-    del wav_tensor
+    speech = vad_detection(wav_file)
     if stop.is_set():
         log("■ stopped", ui=True)
         return None
@@ -583,7 +608,7 @@ def run_pipeline(src, language, out_dir, max_words, upper, strip, emit, stop: th
 # ============================================================
 
 HF_URL = "https://huggingface.co/Cactus-Compute/needle3"
-GH_URL = "https://github.com/NeuralFalconYT"
+GH_URL = "https://github.com/NeuralFalconYT/needle-subtitle"
 
 GITHUB_SVG = (
     '<svg viewBox="0 0 16 16" width="15" height="15" fill="currentColor" aria-hidden="true">'
@@ -593,10 +618,10 @@ GITHUB_SVG = (
 HEADER = f"""
 <div id="hero">
   <h1 class="title">NEEDLE SUBTITLE</h1>
-  <p class="tagline">Subtitles for YouTube, Shorts &amp; word-level timing</p>
+  <p class="tagline">Subtitles for YouTube, Shorts, Instagram &amp; TikTok</p>
   <div class="links">
     <a href="{HF_URL}" target="_blank" rel="noopener">🤗&nbsp; Cactus-Compute/needle3</a>
-    <a href="{GH_URL}" target="_blank" rel="noopener">{GITHUB_SVG}&nbsp; NeuralFalconYT</a>
+    <a href="{GH_URL}" target="_blank" rel="noopener">{GITHUB_SVG}&nbsp; NeuralFalconYT/needle-subtitle</a>
   </div>
 </div>
 """
@@ -627,7 +652,20 @@ body, .gradio-container {
     #09090c !important;
   background-attachment: fixed !important;
 }
-.gradio-container { max-width: 1320px !important; }
+.gradio-container {
+    width: 100% !important;
+    max-width: 1320px !important;
+
+    margin-left: auto !important;
+    margin-right: auto !important;
+
+    padding-left: 24px !important;
+    padding-right: 24px !important;
+
+    box-sizing: border-box !important;
+}
+
+
 footer { display: none !important; }
 
 /* ---------- hero ---------- */
@@ -652,9 +690,11 @@ footer { display: none !important; }
 .card {
   background: rgba(255,255,255,.025) !important;
   border: 1px solid rgba(255,255,255,.08) !important; border-radius: 18px !important;
-  padding: 18px !important; backdrop-filter: blur(10px);
+  padding: 18px !important;
   box-shadow: 0 10px 40px rgba(0,0,0,.35);
 }
+/* dropdown list must sit right under the field and above other content */
+ul.options { z-index: 9999 !important; }
 .card h3 { color: #c9c9d6 !important; font-size: 12px !important; font-weight: 600 !important;
            letter-spacing: 2px; text-transform: uppercase; margin-bottom: 4px; }
 .block { border-radius: 12px !important; }
@@ -708,17 +748,22 @@ def build_ui():
     import gradio as gr
 
     def handler(file_path, path_text, language_name, max_words, upper, strip):
-        def pack(status=None, log=None, files=(None, None, None), texts=(None, None, None)):
+        def pack(status=None, log=None, files=(None, None, None), texts=(None, None, None),
+                 idle=None):
+            """idle=True re-enables the Generate button, None leaves it unchanged."""
             u = gr.update
             return (
                 u() if status is None else status,
                 u() if log is None else log,
                 *[u() if f is None else f for f in files],
                 *[u() if t is None else t for t in texts],
+                u() if idle is None else u(interactive=idle),
             )
 
         # ---- resolve input ----
-        if path_text and path_text.strip():
+        # The path box is only honoured locally; on Spaces it is ignored
+        # (also prevents reading arbitrary server files via a crafted path).
+        if IS_LOCAL and path_text and path_text.strip():
             src = clean_path(path_text)
             out_dir = os.path.dirname(src)
         elif file_path:
@@ -726,10 +771,11 @@ def build_ui():
             stem = os.path.splitext(os.path.basename(src))[0]
             out_dir = os.path.abspath(os.path.join("needle_output", stem))
         else:
-            yield pack("paste a path or drop a file first")
+            yield pack("drop a file first" if ON_SPACES
+                       else "paste a path or drop a file first", idle=True)
             return
         if not os.path.isfile(src):
-            yield pack(f"file not found: {src}")
+            yield pack(f"file not found: {src}", idle=True)
             return
 
         q: queue.Queue = queue.Queue()
@@ -779,15 +825,16 @@ def build_ui():
 
         out = box.get("out")
         if box.get("err"):
-            yield pack("failed", "\n".join(lines))
+            yield pack("failed", "\n".join(lines), idle=True)
         elif out is None:
-            yield pack("stopped", "\n".join(lines))
+            yield pack("stopped", "\n".join(lines), idle=True)
         else:
             yield pack(
                 "done ✔",
                 "\n".join(lines),
                 files=(out["horizontal"][0], out["vertical"][0], out["word"][0]),
                 texts=(out["horizontal"][1], out["vertical"][1], out["word"][1]),
+                idle=True,
             )
 
     blocks_kwargs = {"title": "Needle Subtitle"}
@@ -800,7 +847,7 @@ def build_ui():
 
     def preview_box():
         return gr.Textbox(label="preview", lines=12, max_lines=12, interactive=False,
-                          elem_classes="srt")
+                          autoscroll=False, elem_classes="srt")
 
     with gr.Blocks(**blocks_kwargs) as demo:
         gr.HTML(HEADER)
@@ -808,11 +855,17 @@ def build_ui():
             # ---------------- LEFT ----------------
             with gr.Column(scale=1, min_width=340, elem_classes="card"):
                 gr.Markdown("### Input")
+                # Local-only: hidden on Hugging Face Spaces
                 path_in = gr.Textbox(
-                    label="Paste file path",
+                    label="Paste file path  (local only)",
+                    info="Works only when this app runs on your own computer.",
                     placeholder='C:\\videos\\long.mp4   (quotes or r"" are fine)',
-                    lines=1)
-                file_in = gr.File(label="...or drag & drop video / audio", type="filepath")
+                    lines=1,
+                    visible=IS_LOCAL)
+                file_in = gr.File(
+                    label=("drag & drop video / audio" if ON_SPACES
+                           else "...or drag & drop video / audio"),
+                    type="filepath")
                 lang = gr.Dropdown(list(LANGUAGES), value="English", label="Language")
                 with gr.Accordion("Shorts & word-level options", open=False):
                     words_per_cue = gr.Slider(1, 3, value=3, step=1,
@@ -840,10 +893,17 @@ def build_ui():
                         f3 = gr.File(label="word-level SRT")
                         t3 = preview_box()
 
-        go.click(
+        def clear_outputs():
+            """Runs instantly on click: wipe old results so it is obvious a new run started."""
+            u = gr.update
+            return ("starting ...", "", u(value=None), u(value=None), u(value=None),
+                    "", "", "", u(interactive=False))
+
+        all_outputs = [status, logbox, f1, f2, f3, t1, t2, t3, go]
+        go.click(clear_outputs, inputs=None, outputs=all_outputs, queue=False).then(
             handler,
             inputs=[file_in, path_in, lang, words_per_cue, upper, strip],
-            outputs=[status, logbox, f1, f2, f3, t1, t2, t3],
+            outputs=all_outputs,
         )
         # Stop is its own event (not `cancels=`): it sets a flag the worker checks
         stop_btn.click(request_stop, inputs=None, outputs=[status], queue=False)
@@ -855,4 +915,4 @@ if __name__ == "__main__":
     if not shutil.which("ffmpeg"):
         print("[!] ffmpeg not found on PATH - audio extraction will fail.")
     demo, launch_kwargs = build_ui()
-    demo.queue().launch(inbrowser=True, **launch_kwargs)
+    demo.queue().launch(inbrowser=IS_LOCAL, **launch_kwargs)
