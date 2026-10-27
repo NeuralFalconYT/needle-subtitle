@@ -578,6 +578,10 @@ def run_pipeline(src, language, out_dir, max_words, upper, strip, emit, stop: th
             emit("bar", make_bar(end / duration, t0, "transcribing",
                                  f"chunk {i}/{len(chunks)} · {len(words):,} words"))
     words.sort(key=lambda w: (w["start"], w["end"]))
+    transcript_path = p("transcript.txt")
+    transcript_text = " ".join(w["word"] for w in words).strip()
+    with open(transcript_path, "w", encoding="utf-8-sig", newline="\n") as tf:
+        tf.write(transcript_text + "\n")
     log(f"✔ transcription  ·  {len(words):,} words" + (f"  ({errors} chunks failed)" if errors else ""))
     if not words:
         raise RuntimeError("Needle returned no words. Check the language and the audio.")
@@ -600,6 +604,8 @@ def run_pipeline(src, language, out_dir, max_words, upper, strip, emit, stop: th
     log(f"★ done in {fmt_dur(total)}  ·  {duration / total:.1f}x realtime")
     log(f"📁 {out_dir}")
     emit("bar", f"[{'█' * 30}] 100.0%  done in {fmt_dur(total)}")
+    outputs["transcript"] = (transcript_path, transcript_text)
+    log(f"✔ transcript saved  ·  {os.path.basename(transcript_path)}", ui=False)
     return outputs
 
 
@@ -644,6 +650,13 @@ CSS = """
   --block-title-text-color: #c9c9d6;
   --color-accent: #8b7cf6;
 }
+body {
+  margin: 0 !important;
+}
+.gradio-container, .gradio-container > .main, .gradio-container .main {
+  max-width: none !important;
+  width: 100% !important;
+}
 body, .gradio-container {
   font-family: 'Inter', 'Segoe UI', system-ui, sans-serif !important;
   background:
@@ -654,13 +667,10 @@ body, .gradio-container {
 }
 .gradio-container {
     width: 100% !important;
-    max-width: 1320px !important;
-
-    margin-left: auto !important;
-    margin-right: auto !important;
-
-    padding-left: 24px !important;
-    padding-right: 24px !important;
+    max-width: none !important;
+    margin: 0 !important;
+    padding-left: clamp(10px, 1.5vw, 24px) !important;
+    padding-right: clamp(10px, 1.5vw, 24px) !important;
 
     box-sizing: border-box !important;
 }
@@ -748,8 +758,8 @@ def build_ui():
     import gradio as gr
 
     def handler(file_path, path_text, language_name, max_words, upper, strip):
-        def pack(status=None, log=None, files=(None, None, None), texts=(None, None, None),
-                 idle=None):
+        def pack(status=None, log=None, files=(None, None, None, None),
+                 texts=(None, None, None, None), idle=None):
             """idle=True re-enables the Generate button, None leaves it unchanged."""
             u = gr.update
             return (
@@ -832,8 +842,10 @@ def build_ui():
             yield pack(
                 "done ✔",
                 "\n".join(lines),
-                files=(out["horizontal"][0], out["vertical"][0], out["word"][0]),
-                texts=(out["horizontal"][1], out["vertical"][1], out["word"][1]),
+                files=(out["horizontal"][0], out["vertical"][0], out["word"][0],
+                       out["transcript"][0]),
+                texts=(out["horizontal"][1], out["vertical"][1], out["word"][1],
+                       out["transcript"][1]),
                 idle=True,
             )
 
@@ -892,14 +904,22 @@ def build_ui():
                     with gr.Tab("3 · Word level"):
                         f3 = gr.File(label="word-level SRT")
                         t3 = preview_box()
+                    with gr.Tab("4 · Transcript TXT"):
+                        transcript_file = gr.File(label="Transcript .txt download",
+                                                  file_count="single", interactive=False)
+                        transcript_preview = gr.Textbox(
+                            label="Transcript preview", lines=18, max_lines=18,
+                            interactive=False, show_copy_button=True,
+                            autoscroll=False, elem_classes="srt")
 
         def clear_outputs():
             """Runs instantly on click: wipe old results so it is obvious a new run started."""
             u = gr.update
             return ("starting ...", "", u(value=None), u(value=None), u(value=None),
-                    "", "", "", u(interactive=False))
+                    u(value=None), "", "", "", "", u(interactive=False))
 
-        all_outputs = [status, logbox, f1, f2, f3, t1, t2, t3, go]
+        all_outputs = [status, logbox, f1, f2, f3, transcript_file,
+                       t1, t2, t3, transcript_preview, go]
         go.click(clear_outputs, inputs=None, outputs=all_outputs, queue=False).then(
             handler,
             inputs=[file_in, path_in, lang, words_per_cue, upper, strip],
